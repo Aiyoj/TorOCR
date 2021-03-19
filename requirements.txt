@@ -1,0 +1,15 @@
+opencv-python
+numpy
+scipy
+addict
+imgaug
+matplotlib
+msgpack
+msgpack-numpy
+Pillow
+pyclipper
+PyYAML
+Shapely
+tensorboardX
+torch
+zmq

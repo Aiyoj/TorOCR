@@ -1,0 +1,153 @@
+import os
+import sys
+import zmq
+import uuid
+import atexit
+import weakref
+import threading
+import multiprocessing as mp
+
+from torocr.utils.common_utils import del_weakref
+from torocr.utils.zmq_utils import auto_bind, multi_socket
+from torocr.dataflow.common import DataFlow, BatchData
+from torocr.dataflow.serialize import MsgPackSerializer
+from torocr.dataflow.common import DataFlowReentrantGuard
+
+
+def _get_pipe_name(name):
+    if sys.platform.startswith('linux'):
+        # linux supports abstract sockets: http://api.zeromq.org/4-1:zmq-ipc
+        pipename = "ipc://@{}-pipe-{}".format(name, str(uuid.uuid1())[:8])
+    else:
+        pipedir = '.'
+        assert os.path.isdir(pipedir), pipedir
+        filename = '{}/{}-pipe-{}'.format(pipedir.rstrip('/'), name, str(uuid.uuid1())[:6])
+        assert not os.path.exists(filename), "Pipe {} exists! You may be unlucky.".format(filename)
+        pipename = "ipc://{}".format(filename)
+
+    return pipename
+
+
+class MapAndBatchData(DataFlow):
+    class _Dispatcher(mp.Process):
+        def __init__(self, ds, pipe_name, hwm):
+            super(MapAndBatchData._Dispatcher, self).__init__()
+
+            self.ds = ds
+            self.pipe_name = pipe_name
+            self.hwm = hwm
+            self.daemon = True
+
+        def run(self):
+            ctx = zmq.Context()
+            socket = ctx.socket(zmq.PUSH)
+            socket.set_hwm(self.hwm)
+            socket.bind(self.pipe_name)
+            self.ds.start()
+            i = 0
+            for dp in self.ds:
+                i += 1
+                # print(i)
+                socket.send(MsgPackSerializer.dumps(dp), copy=False)
+
+    class _Worker(mp.Process):
+        def __init__(self, identity, map_func, input_pipe, output_pipe, hwm, batch_size):
+            super(MapAndBatchData._Worker, self).__init__()
+
+            self.identity = identity
+            self.map_func = map_func
+            self.input_pipe = input_pipe
+            self.output_pipe = output_pipe
+            self.hwm = hwm
+            self.batch_size = batch_size
+            self.daemon = True
+
+        def run(self):
+            ctx = zmq.Context()
+
+            socket = ctx.socket(zmq.PULL)
+            socket.setsockopt(zmq.IDENTITY, self.identity)
+            socket.set_hwm(self.hwm * self.batch_size)
+            socket.connect(self.input_pipe)
+
+            out_socket = ctx.socket(zmq.PUSH)
+            out_socket.set_hwm(max(self.hwm, 5))
+            out_socket.connect(self.output_pipe)
+
+            batch = []
+            j = 0
+            while True:
+                j += 1
+                dp = MsgPackSerializer.loads(socket.recv(copy=False))
+                dp = self.map_func(dp)
+                if dp is not None:
+                    batch.append(dp)
+                    if len(batch) == self.batch_size:
+                        dp = BatchData.aggregate_batch(batch, use_list=True)
+                        out_socket.send(MsgPackSerializer.dumps(dp), copy=False)
+                        del batch[:]
+
+    def __init__(self, ds, num_proc, map_func, batch_size, buffer_size=None, ):
+        super(MapAndBatchData, self).__init__()
+
+        if buffer_size is not None:
+            assert batch_size < buffer_size
+
+        self.ds = ds
+        self.num_proc = num_proc
+        self.map_func = map_func
+        self.batch_size = batch_size
+        if buffer_size is None:
+            buffer_size = batch_size * 100
+        self.buffer_size = buffer_size
+
+    def start(self):
+        super(MapAndBatchData, self).start()
+
+        atexit.register(del_weakref, weakref.ref(self))
+        self._guard = DataFlowReentrantGuard()
+
+        job_pipe = _get_pipe_name("dataflow_MaB_job")
+        ret_pipe = _get_pipe_name("dataflow_MaB_result")
+
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.PULL)
+        self.socket.set_hwm(max(5, self.buffer_size // self.batch_size))
+        self.socket.bind(ret_pipe)
+
+        dispatcher = MapAndBatchData._Dispatcher(self.ds, job_pipe, self.buffer_size)
+
+        self._proc_ids = ["{}".format(k).encode("utf-8") for k in range(self.num_proc)]
+        # worker_hwm = max(3, self.buffer_size // self.num_proc // self.batch_size)
+        worker_hwm = max(3, self.buffer_size)
+        self._procs = [
+            MapAndBatchData._Worker(self._proc_ids[k], self.map_func, job_pipe, ret_pipe, worker_hwm, self.batch_size)
+            for k in range(self.num_proc)
+        ]
+
+        self._procs.append(dispatcher)
+
+        for p in self._procs:
+            p.start()
+
+    def __del__(self):
+        try:
+            if not self._start_done:
+                return
+            if not self.context.closed:
+                self.socket.close(0)
+                self.context.destroy(0)
+            for x in self._procs:
+                x.terminate()
+                x.join(5)
+            print("{} successfully cleaned-up.".format(type(self).__name__))
+        except Exception as e:
+            pass
+
+    def __iter__(self):
+        with self._guard:
+            while True:
+                yield MsgPackSerializer.loads(self.socket.recv(copy=False))
+
+    def __len__(self):
+        return len(self.ds)
